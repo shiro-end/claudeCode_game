@@ -17,6 +17,14 @@
       letter-spacing: 2px;
     }
     #hud span { color: #0ff; }
+    #end-btn {
+      pointer-events: all;
+      background: transparent; border: 1px solid #f44; color: #f44;
+      font-family: 'Courier New', monospace; font-size: 13px;
+      letter-spacing: 2px; padding: 5px 14px; cursor: pointer;
+      border-radius: 3px; transition: background 0.15s;
+    }
+    #end-btn:hover { background: rgba(255,68,68,0.2); }
 
     /* Start Screen */
     #start-screen {
@@ -87,6 +95,7 @@
   <div>KILLS <span id="hud-kills">0</span></div>
   <div>UPGRADE <span id="hud-next">20</span>s</div>
   <div>TIME <span id="hud-time">0</span>s</div>
+  <button id="end-btn">END</button>
 </div>
 
 <div id="start-screen">
@@ -132,9 +141,79 @@ const BASE_DAMAGE      = 1;
 // ─── State ───────────────────────────────────────────────────────────────────
 let phase = 'start'; // start | playing | upgrade | gameover
 let time, score, kills, lastUpgradeAt;
-let player, bullets, enemies, particles, blastFX;
+let player, bullets, enemies, particles, blastFX, floatingTexts;
 let spawnTimer, lastTS;
+let timeScale, slowMoPending, slowMoTimer;
 const keys = new Set();
+
+// ─── Audio ───────────────────────────────────────────────────────────────────
+let audioCtx = null;
+function getAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+
+function sfxKill(tough = false) {
+  try {
+    const ctx = getAudio();
+    const dur = tough ? 0.28 : 0.14;
+    const vol = tough ? 0.45 : 0.28;
+    const freq = tough ? 300 : 700;
+
+    const bufSize = Math.floor(ctx.sampleRate * dur);
+    const buf = ctx.createBuffer(1, bufSize, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < bufSize; i++) data[i] = Math.random() * 2 - 1;
+
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(freq, ctx.currentTime);
+    filter.frequency.exponentialRampToValueAtTime(80, ctx.currentTime + dur);
+
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(vol, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + dur);
+
+    src.connect(filter); filter.connect(gain); gain.connect(ctx.destination);
+    src.start(ctx.currentTime);
+  } catch(e) {}
+}
+
+function sfxUpgrade() {
+  try {
+    const ctx = getAudio();
+    [523, 659, 784, 1047].forEach((freq, i) => {
+      const t = ctx.currentTime + i * 0.08;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, t);
+      gain.gain.setValueAtTime(0, t);
+      gain.gain.linearRampToValueAtTime(0.14, t + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.start(t); osc.stop(t + 0.25);
+    });
+  } catch(e) {}
+}
+
+function sfxGameOver() {
+  try {
+    const ctx = getAudio();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(380, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(60, ctx.currentTime + 0.9);
+    gain.gain.setValueAtTime(0.22, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.9);
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.9);
+  } catch(e) {}
+}
 
 // ─── Upgrades ────────────────────────────────────────────────────────────────
 const UPGRADES = [
@@ -151,7 +230,8 @@ const UPGRADES = [
 function initGame() {
   time = 0; score = 0; kills = 0; lastUpgradeAt = 0;
   spawnTimer = 0; lastTS = performance.now();
-  bullets = []; enemies = []; particles = []; blastFX = [];
+  timeScale = 1; slowMoPending = false; slowMoTimer = 0;
+  bullets = []; enemies = []; particles = []; blastFX = []; floatingTexts = [];
 
   player = {
     x: canvas.width / 2, y: canvas.height / 2,
@@ -201,6 +281,14 @@ function particles_burst(x, y, color, n = 8) {
   }
 }
 
+function killEnemy(e, idx) {
+  particles_burst(e.x, e.y, e.color, 12);
+  floatingTexts.push({ x: e.x, y: e.y, value: e.pts, life: 0.9, maxLife: 0.9 });
+  score += e.pts; kills++;
+  sfxKill(e.type === 'tough');
+  enemies.splice(idx, 1);
+}
+
 function spawnEnemy() {
   const side = Math.floor(Math.random() * 4);
   let x, y;
@@ -238,11 +326,7 @@ function fireBlast() {
     const e = enemies[i];
     if (dist(player.x, player.y, e.x, e.y) < player.blastR + e.r) {
       e.hp -= player.bdamage * player.bdamageMult;
-      if (e.hp <= 0) {
-        particles_burst(e.x, e.y, e.color, 12);
-        score += e.pts; kills++;
-        enemies.splice(i, 1);
-      }
+      if (e.hp <= 0) killEnemy(e, i);
     }
   }
 }
@@ -347,11 +431,7 @@ function update(dt) {
           bullets.splice(i, 1);
           dead = true;
         }
-        if (e.hp <= 0) {
-          particles_burst(e.x, e.y, e.color, 12);
-          score += e.pts; kills++;
-          enemies.splice(j, 1);
-        }
+        if (e.hp <= 0) killEnemy(e, j);
         if (dead) break;
       }
     }
@@ -386,10 +466,20 @@ function update(dt) {
     if (p.life <= 0) particles.splice(i, 1);
   }
 
-  // Upgrade trigger
-  if (time - lastUpgradeAt >= UPGRADE_INTERVAL) {
+  // Floating texts
+  for (let i = floatingTexts.length - 1; i >= 0; i--) {
+    const t = floatingTexts[i];
+    t.life -= dt;
+    t.y -= 48 * dt;
+    if (t.life <= 0) floatingTexts.splice(i, 1);
+  }
+
+  // Upgrade trigger → slow mo first
+  if (time - lastUpgradeAt >= UPGRADE_INTERVAL && !slowMoPending) {
     lastUpgradeAt = time;
-    showUpgrade(); return;
+    slowMoPending = true;
+    slowMoTimer = 0.45;
+    timeScale = 0.1;
   }
 
   updateHUD();
@@ -400,7 +490,7 @@ function updateHUD() {
   document.getElementById('hud-kills').textContent = kills;
   document.getElementById('hud-time').textContent  = Math.floor(time);
   const nxt = Math.ceil(UPGRADE_INTERVAL - (time - lastUpgradeAt));
-  document.getElementById('hud-next').textContent  = nxt;
+  document.getElementById('hud-next').textContent  = Math.max(0, nxt);
 }
 
 // ─── Draw ────────────────────────────────────────────────────────────────────
@@ -495,11 +585,27 @@ function draw() {
     ctx.lineWidth = 3;
     ctx.stroke();
   }
+
+  // Floating score texts
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 15px Courier New';
+  for (const t of floatingTexts) {
+    const a = t.life / t.maxLife;
+    ctx.globalAlpha = a;
+    ctx.shadowBlur = 8;
+    ctx.shadowColor = '#ffee44';
+    ctx.fillStyle = '#ffee44';
+    ctx.fillText(`+${t.value}`, t.x, t.y);
+  }
+  ctx.globalAlpha = 1;
+  ctx.shadowBlur = 0;
+  ctx.textAlign = 'left';
 }
 
 // ─── Screens ─────────────────────────────────────────────────────────────────
 function showUpgrade() {
   phase = 'upgrade';
+  timeScale = 1;
 
   const stackable = new Set(['rapidfire','bulletspeed','swift','multishot','homing','blast','heavyshot']);
   let pool = UPGRADES.filter(u => stackable.has(u.id) || !player.takenUpgrades.includes(u.id));
@@ -519,6 +625,7 @@ function showUpgrade() {
     card.innerHTML = `<div class="icon">${u.icon}</div><h3>${u.name}</h3><p>${u.desc}</p>`;
     card.addEventListener('click', () => {
       applyUpgrade(u.id);
+      sfxUpgrade();
       document.getElementById('upgrade-screen').style.display = 'none';
       phase = 'playing';
       lastTS = performance.now();
@@ -531,6 +638,8 @@ function showUpgrade() {
 
 function triggerGameOver() {
   phase = 'gameover';
+  timeScale = 1;
+  sfxGameOver();
   document.getElementById('go-score').textContent = `SCORE  ${score}`;
   document.getElementById('go-time').textContent  = `生存時間: ${Math.floor(time)} 秒`;
   document.getElementById('go-kills').textContent = `撃破数: ${kills}`;
@@ -540,9 +649,23 @@ function triggerGameOver() {
 // ─── Game Loop ────────────────────────────────────────────────────────────────
 function loop(ts) {
   if (phase !== 'playing') return;
-  const dt = Math.min((ts - lastTS) / 1000, 0.05);
+
+  const realDt = Math.min((ts - lastTS) / 1000, 0.05);
   lastTS = ts;
+
+  // Slow mo countdown (uses real time, not scaled)
+  if (slowMoPending) {
+    slowMoTimer -= realDt;
+    if (slowMoTimer <= 0) {
+      slowMoPending = false;
+      showUpgrade();
+      return;
+    }
+  }
+
+  const dt = realDt * timeScale;
   update(dt);
+
   if (phase === 'playing') {
     draw();
     requestAnimationFrame(loop);
@@ -552,13 +675,13 @@ function loop(ts) {
 // ─── Input ────────────────────────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
   keys.add(e.key);
-  // Prevent arrow key scrolling
   if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
 });
 document.addEventListener('keyup', e => keys.delete(e.key));
 
 // ─── Buttons ─────────────────────────────────────────────────────────────────
 document.getElementById('start-btn').addEventListener('click', () => {
+  getAudio(); // AudioContext を初回クリックで起動
   document.getElementById('start-screen').style.display = 'none';
   initGame();
   phase = 'playing';
@@ -572,6 +695,10 @@ document.getElementById('retry-btn').addEventListener('click', () => {
   phase = 'playing';
   lastTS = performance.now();
   requestAnimationFrame(loop);
+});
+
+document.getElementById('end-btn').addEventListener('click', () => {
+  if (phase === 'playing') triggerGameOver();
 });
 </script>
 </body>
