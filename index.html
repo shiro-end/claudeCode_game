@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SURGE</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; font-family: 'Courier New', monospace; }
+    canvas { display: block; }
+
+    #hud {
+      position: fixed; top: 0; left: 0; right: 0;
+      padding: 14px 24px;
+      display: flex; justify-content: space-between; align-items: center;
+      color: #fff; font-size: 16px; pointer-events: none;
+      letter-spacing: 2px;
+    }
+    #hud span { color: #0ff; }
+
+    /* Start Screen */
+    #start-screen {
+      position: fixed; inset: 0;
+      background: #000;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 16px;
+    }
+    #start-screen h1 {
+      color: #0ff; font-size: 80px; letter-spacing: 16px;
+      text-shadow: 0 0 40px #0ff, 0 0 80px #0ff;
+    }
+    #start-screen p { color: #888; font-size: 15px; letter-spacing: 1px; }
+    .btn {
+      margin-top: 16px; padding: 14px 52px;
+      background: transparent; color: #0ff;
+      border: 2px solid #0ff; font-size: 20px;
+      cursor: pointer; border-radius: 4px;
+      font-family: 'Courier New', monospace;
+      letter-spacing: 4px;
+      transition: background 0.2s, color 0.2s;
+    }
+    .btn:hover { background: #0ff; color: #000; }
+
+    /* Upgrade Screen */
+    #upgrade-screen {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.85);
+      display: none; flex-direction: column; align-items: center; justify-content: center;
+      gap: 12px;
+    }
+    #upgrade-screen h2 {
+      color: #fff; font-size: 24px; letter-spacing: 4px;
+      margin-bottom: 10px;
+    }
+    #upgrade-cards { display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; }
+    .upgrade-card {
+      background: #0a0a1a; border: 2px solid #333;
+      padding: 24px 28px; cursor: pointer;
+      width: 220px; text-align: center; border-radius: 8px;
+      transition: border-color 0.15s, background 0.15s, transform 0.1s;
+    }
+    .upgrade-card:hover {
+      border-color: #0ff; background: #0d1a1a;
+      transform: translateY(-4px);
+    }
+    .upgrade-card .icon { font-size: 32px; margin-bottom: 10px; }
+    .upgrade-card h3 { color: #0ff; font-size: 16px; margin-bottom: 8px; letter-spacing: 2px; }
+    .upgrade-card p { color: #888; font-size: 13px; line-height: 1.6; }
+
+    /* Game Over Screen */
+    #gameover-screen {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.88);
+      display: none; flex-direction: column; align-items: center; justify-content: center;
+      gap: 14px;
+    }
+    #gameover-screen h1 { color: #f44; font-size: 56px; letter-spacing: 8px; text-shadow: 0 0 30px #f44; }
+    #gameover-screen .stat { color: #ccc; font-size: 18px; letter-spacing: 2px; }
+    #gameover-screen .score { color: #0ff; font-size: 28px; letter-spacing: 4px; margin: 6px 0; }
+  </style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+
+<div id="hud">
+  <div>SCORE <span id="hud-score">0</span></div>
+  <div>KILLS <span id="hud-kills">0</span></div>
+  <div>UPGRADE <span id="hud-next">20</span>s</div>
+  <div>TIME <span id="hud-time">0</span>s</div>
+</div>
+
+<div id="start-screen">
+  <h1>SURGE</h1>
+  <p>WASD / 矢印キー で移動 &nbsp;|&nbsp; 自動攻撃 &nbsp;|&nbsp; 20秒ごとに強化選択</p>
+  <p style="color:#555">敵に触れたらゲームオーバー</p>
+  <button class="btn" id="start-btn">START</button>
+</div>
+
+<div id="upgrade-screen">
+  <h2>— POWER UP —</h2>
+  <p style="color:#666; font-size:13px; letter-spacing:2px; margin-bottom:8px">1つ選んでください</p>
+  <div id="upgrade-cards"></div>
+</div>
+
+<div id="gameover-screen">
+  <h1>GAME OVER</h1>
+  <div class="score" id="go-score"></div>
+  <div class="stat" id="go-time"></div>
+  <div class="stat" id="go-kills"></div>
+  <button class="btn" id="retry-btn">RETRY</button>
+</div>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+function resizeCanvas() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+const UPGRADE_INTERVAL = 20;
+const BASE_FIRE_RATE   = 0.30;
+const BASE_BULLET_SPD  = 380;
+const BASE_PLAYER_SPD  = 210;
+const BASE_BULLET_SIZE = 5;
+const BASE_DAMAGE      = 1;
+
+// ─── State ───────────────────────────────────────────────────────────────────
+let phase = 'start'; // start | playing | upgrade | gameover
+let time, score, kills, lastUpgradeAt;
+let player, bullets, enemies, particles, blastFX;
+let spawnTimer, lastTS;
+const keys = new Set();
+
+// ─── Upgrades ────────────────────────────────────────────────────────────────
+const UPGRADES = [
+  { id: 'rapidfire',   icon: '⚡', name: 'Rapid Fire',   desc: '発射速度 +50%' },
+  { id: 'bulletspeed', icon: '→', name: 'Bullet Speed',  desc: '弾速 +40%' },
+  { id: 'multishot',   icon: '✦', name: 'Multi Shot',    desc: '発射方向を増やす' },
+  { id: 'piercing',    icon: '◈', name: 'Piercing',      desc: '弾が敵を貫通する' },
+  { id: 'swift',       icon: '◎', name: 'Swift',         desc: '移動速度 +30%' },
+  { id: 'heavyshot',   icon: '●', name: 'Heavy Shot',    desc: '弾サイズ・ダメージ ×2' },
+  { id: 'blast',       icon: '💥', name: 'Blast',         desc: '3秒ごとに周囲を爆発' },
+  { id: 'homing',      icon: '⟳', name: 'Homing',        desc: '弾が敵の方向へ曲がる' },
+];
+
+function initGame() {
+  time = 0; score = 0; kills = 0; lastUpgradeAt = 0;
+  spawnTimer = 0; lastTS = performance.now();
+  bullets = []; enemies = []; particles = []; blastFX = [];
+
+  player = {
+    x: canvas.width / 2, y: canvas.height / 2,
+    r: 14,
+    speed: BASE_PLAYER_SPD, speedMult: 1,
+    fireRate: BASE_FIRE_RATE, fireRateMult: 1, fireCd: 0,
+    bspeed: BASE_BULLET_SPD, bspeedMult: 1,
+    bdamage: BASE_DAMAGE, bdamageMult: 1,
+    bsize: BASE_BULLET_SIZE, bsizeMult: 1,
+    dirs: 4,
+    piercing: false,
+    homing: 0,
+    blastOn: false, blastCd: 0, blastInterval: 3, blastR: 110,
+    takenUpgrades: [],
+  };
+}
+
+function applyUpgrade(id) {
+  player.takenUpgrades.push(id);
+  switch (id) {
+    case 'rapidfire':   player.fireRateMult  *= 0.55; break;
+    case 'bulletspeed': player.bspeedMult    *= 1.4;  break;
+    case 'multishot':   player.dirs = Math.min(player.dirs + 4, 24); break;
+    case 'piercing':    player.piercing = true; break;
+    case 'swift':       player.speedMult     *= 1.3;  break;
+    case 'heavyshot':   player.bdamageMult   *= 2; player.bsizeMult *= 1.5; break;
+    case 'blast':
+      if (!player.blastOn) { player.blastOn = true; player.blastCd = player.blastInterval; }
+      else { player.blastR *= 1.5; }
+      break;
+    case 'homing':      player.homing += 0.04; break;
+  }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+function dist(ax, ay, bx, by) {
+  const dx = ax - bx, dy = ay - by;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+function particles_burst(x, y, color, n = 8) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const s = 60 + Math.random() * 140;
+    const life = 0.35 + Math.random() * 0.3;
+    particles.push({ x, y, vx: Math.cos(a)*s, vy: Math.sin(a)*s, life, maxLife: life, color, r: 2 + Math.random()*3 });
+  }
+}
+
+function spawnEnemy() {
+  const side = Math.floor(Math.random() * 4);
+  let x, y;
+  const W = canvas.width, H = canvas.height;
+  if (side === 0) { x = Math.random()*W; y = -25; }
+  else if (side === 1) { x = W+25; y = Math.random()*H; }
+  else if (side === 2) { x = Math.random()*W; y = H+25; }
+  else { x = -25; y = Math.random()*H; }
+
+  let type = 'basic';
+  const r = Math.random();
+  if (time > 60 && r < 0.18) type = 'fast';
+  else if (time > 35 && r < 0.35) type = 'tough';
+
+  const e = { x, y, type };
+  if (type === 'basic') {
+    e.r = 13; e.hp = 1; e.maxHp = 1;
+    e.speed = 85 + time * 0.28;
+    e.color = '#ff3333'; e.pts = 10;
+  } else if (type === 'tough') {
+    e.r = 20; e.hp = 3; e.maxHp = 3;
+    e.speed = 58 + time * 0.18;
+    e.color = '#ff8800'; e.pts = 30;
+  } else {
+    e.r = 9; e.hp = 1; e.maxHp = 1;
+    e.speed = 170 + time * 0.38;
+    e.color = '#dd00ff'; e.pts = 20;
+  }
+  enemies.push(e);
+}
+
+function fireBlast() {
+  blastFX.push({ x: player.x, y: player.y, r: 0, maxR: player.blastR, life: 0.35 });
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    const e = enemies[i];
+    if (dist(player.x, player.y, e.x, e.y) < player.blastR + e.r) {
+      e.hp -= player.bdamage * player.bdamageMult;
+      if (e.hp <= 0) {
+        particles_burst(e.x, e.y, e.color, 12);
+        score += e.pts; kills++;
+        enemies.splice(i, 1);
+      }
+    }
+  }
+}
+
+function fireBullets() {
+  const spd   = player.bspeed * player.bspeedMult;
+  const size  = player.bsize  * player.bsizeMult;
+  const dmg   = player.bdamage * player.bdamageMult;
+  for (let i = 0; i < player.dirs; i++) {
+    const a = (Math.PI * 2 / player.dirs) * i;
+    bullets.push({
+      x: player.x, y: player.y,
+      vx: Math.cos(a) * spd, vy: Math.sin(a) * spd,
+      size, dmg,
+      piercing: player.piercing,
+      homing: player.homing,
+      hit: new Set(),
+    });
+  }
+}
+
+// ─── Update ──────────────────────────────────────────────────────────────────
+function update(dt) {
+  time += dt;
+
+  // Player movement
+  let dx = 0, dy = 0;
+  if (keys.has('ArrowLeft')  || keys.has('a') || keys.has('A')) dx -= 1;
+  if (keys.has('ArrowRight') || keys.has('d') || keys.has('D')) dx += 1;
+  if (keys.has('ArrowUp')    || keys.has('w') || keys.has('W')) dy -= 1;
+  if (keys.has('ArrowDown')  || keys.has('s') || keys.has('S')) dy += 1;
+  if (dx && dy) { dx *= 0.707; dy *= 0.707; }
+  const spd = player.speed * player.speedMult;
+  player.x = Math.max(player.r, Math.min(canvas.width  - player.r, player.x + dx * spd * dt));
+  player.y = Math.max(player.r, Math.min(canvas.height - player.r, player.y + dy * spd * dt));
+
+  // Auto-fire
+  player.fireCd -= dt;
+  if (player.fireCd <= 0) {
+    fireBullets();
+    player.fireCd = player.fireRate * player.fireRateMult;
+  }
+
+  // Blast
+  if (player.blastOn) {
+    player.blastCd -= dt;
+    if (player.blastCd <= 0) {
+      fireBlast();
+      player.blastCd = player.blastInterval;
+    }
+  }
+
+  // Blast FX
+  for (let i = blastFX.length - 1; i >= 0; i--) {
+    const b = blastFX[i];
+    b.life -= dt;
+    b.r = b.maxR * (1 - b.life / 0.35);
+    if (b.life <= 0) blastFX.splice(i, 1);
+  }
+
+  // Bullets
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+
+    // Homing
+    if (b.homing > 0 && enemies.length > 0) {
+      let nearest = null, nd2 = Infinity;
+      for (const e of enemies) {
+        const d2 = (e.x-b.x)**2 + (e.y-b.y)**2;
+        if (d2 < nd2) { nd2 = d2; nearest = e; }
+      }
+      if (nearest) {
+        const len = Math.sqrt(nd2);
+        const nx = (nearest.x - b.x) / len, ny = (nearest.y - b.y) / len;
+        b.vx += nx * b.homing * 600 * dt;
+        b.vy += ny * b.homing * 600 * dt;
+        const cur = Math.sqrt(b.vx*b.vx + b.vy*b.vy);
+        const target = player.bspeed * player.bspeedMult;
+        b.vx = b.vx / cur * target;
+        b.vy = b.vy / cur * target;
+      }
+    }
+
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+
+    if (b.x < -80 || b.x > canvas.width+80 || b.y < -80 || b.y > canvas.height+80) {
+      bullets.splice(i, 1); continue;
+    }
+
+    // Collision
+    let dead = false;
+    for (let j = enemies.length - 1; j >= 0; j--) {
+      const e = enemies[j];
+      if (b.hit.has(e)) continue;
+      if (dist(b.x, b.y, e.x, e.y) < b.size + e.r) {
+        e.hp -= b.dmg;
+        particles_burst(b.x, b.y, e.color, 4);
+        if (b.piercing) {
+          b.hit.add(e);
+        } else {
+          bullets.splice(i, 1);
+          dead = true;
+        }
+        if (e.hp <= 0) {
+          particles_burst(e.x, e.y, e.color, 12);
+          score += e.pts; kills++;
+          enemies.splice(j, 1);
+        }
+        if (dead) break;
+      }
+    }
+  }
+
+  // Enemy spawn
+  spawnTimer -= dt;
+  if (spawnTimer <= 0) {
+    spawnEnemy();
+    if (time > 25 && Math.random() < 0.35) spawnEnemy();
+    if (time > 55 && Math.random() < 0.40) spawnEnemy();
+    spawnTimer = Math.max(0.38, 1.6 - time * 0.01);
+  }
+
+  // Enemies move & check collision
+  for (const e of enemies) {
+    const dx2 = player.x - e.x, dy2 = player.y - e.y;
+    const len = Math.sqrt(dx2*dx2 + dy2*dy2);
+    e.x += (dx2/len) * e.speed * dt;
+    e.y += (dy2/len) * e.speed * dt;
+    if (dist(player.x, player.y, e.x, e.y) < player.r + e.r) {
+      triggerGameOver(); return;
+    }
+  }
+
+  // Particles
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life -= dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vx *= 0.92; p.vy *= 0.92;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+
+  // Upgrade trigger
+  if (time - lastUpgradeAt >= UPGRADE_INTERVAL) {
+    lastUpgradeAt = time;
+    showUpgrade(); return;
+  }
+
+  updateHUD();
+}
+
+function updateHUD() {
+  document.getElementById('hud-score').textContent = score;
+  document.getElementById('hud-kills').textContent = kills;
+  document.getElementById('hud-time').textContent  = Math.floor(time);
+  const nxt = Math.ceil(UPGRADE_INTERVAL - (time - lastUpgradeAt));
+  document.getElementById('hud-next').textContent  = nxt;
+}
+
+// ─── Draw ────────────────────────────────────────────────────────────────────
+function draw() {
+  const W = canvas.width, H = canvas.height;
+
+  // Background
+  ctx.fillStyle = '#04040f';
+  ctx.fillRect(0, 0, W, H);
+
+  // Subtle grid
+  ctx.strokeStyle = 'rgba(255,255,255,0.025)';
+  ctx.lineWidth = 1;
+  const gs = 56;
+  for (let x = 0; x < W; x += gs) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+  for (let y = 0; y < H; y += gs) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+
+  // Blast FX
+  for (const b of blastFX) {
+    const a = b.life / 0.35;
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, Math.PI*2);
+    ctx.strokeStyle = `rgba(255,200,50,${a*0.9})`;
+    ctx.lineWidth = 4;
+    ctx.stroke();
+    ctx.fillStyle = `rgba(255,200,50,${a*0.12})`;
+    ctx.fill();
+  }
+
+  // Particles
+  for (const p of particles) {
+    const a = p.life / p.maxLife;
+    ctx.globalAlpha = a;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r * a, 0, Math.PI*2);
+    ctx.fillStyle = p.color;
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // Bullets
+  ctx.shadowBlur = 12;
+  ctx.shadowColor = '#ffee00';
+  for (const b of bullets) {
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.size, 0, Math.PI*2);
+    ctx.fillStyle = '#ffee44';
+    ctx.fill();
+  }
+  ctx.shadowBlur = 0;
+
+  // Enemies
+  for (const e of enemies) {
+    ctx.shadowBlur = 18;
+    ctx.shadowColor = e.color;
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, e.r, 0, Math.PI*2);
+    ctx.fillStyle = e.color;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // HP bar for tough enemies
+    if (e.maxHp > 1) {
+      const bw = 30;
+      ctx.fillStyle = '#222';
+      ctx.fillRect(e.x - bw/2, e.y - e.r - 10, bw, 5);
+      ctx.fillStyle = e.color;
+      ctx.fillRect(e.x - bw/2, e.y - e.r - 10, bw * (e.hp / e.maxHp), 5);
+    }
+  }
+
+  // Player glow
+  ctx.shadowBlur = 30;
+  ctx.shadowColor = '#00ffff';
+  ctx.beginPath();
+  ctx.arc(player.x, player.y, player.r + 5, 0, Math.PI*2);
+  ctx.fillStyle = 'rgba(0,255,255,0.12)';
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.arc(player.x, player.y, player.r, 0, Math.PI*2);
+  ctx.fillStyle = '#00ffff';
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // Blast cooldown arc
+  if (player.blastOn) {
+    const prog = 1 - (player.blastCd / player.blastInterval);
+    ctx.beginPath();
+    ctx.arc(player.x, player.y, player.r + 10, -Math.PI/2, -Math.PI/2 + Math.PI*2*prog);
+    ctx.strokeStyle = 'rgba(255,200,50,0.7)';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+  }
+}
+
+// ─── Screens ─────────────────────────────────────────────────────────────────
+function showUpgrade() {
+  phase = 'upgrade';
+
+  const stackable = new Set(['rapidfire','bulletspeed','swift','multishot','homing','blast','heavyshot']);
+  let pool = UPGRADES.filter(u => stackable.has(u.id) || !player.takenUpgrades.includes(u.id));
+
+  // Shuffle
+  for (let i = pool.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i+1));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+  const choices = pool.slice(0, 3);
+
+  const wrap = document.getElementById('upgrade-cards');
+  wrap.innerHTML = '';
+  for (const u of choices) {
+    const card = document.createElement('div');
+    card.className = 'upgrade-card';
+    card.innerHTML = `<div class="icon">${u.icon}</div><h3>${u.name}</h3><p>${u.desc}</p>`;
+    card.addEventListener('click', () => {
+      applyUpgrade(u.id);
+      document.getElementById('upgrade-screen').style.display = 'none';
+      phase = 'playing';
+      lastTS = performance.now();
+      requestAnimationFrame(loop);
+    });
+    wrap.appendChild(card);
+  }
+  document.getElementById('upgrade-screen').style.display = 'flex';
+}
+
+function triggerGameOver() {
+  phase = 'gameover';
+  document.getElementById('go-score').textContent = `SCORE  ${score}`;
+  document.getElementById('go-time').textContent  = `生存時間: ${Math.floor(time)} 秒`;
+  document.getElementById('go-kills').textContent = `撃破数: ${kills}`;
+  document.getElementById('gameover-screen').style.display = 'flex';
+}
+
+// ─── Game Loop ────────────────────────────────────────────────────────────────
+function loop(ts) {
+  if (phase !== 'playing') return;
+  const dt = Math.min((ts - lastTS) / 1000, 0.05);
+  lastTS = ts;
+  update(dt);
+  if (phase === 'playing') {
+    draw();
+    requestAnimationFrame(loop);
+  }
+}
+
+// ─── Input ────────────────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  keys.add(e.key);
+  // Prevent arrow key scrolling
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+});
+document.addEventListener('keyup', e => keys.delete(e.key));
+
+// ─── Buttons ─────────────────────────────────────────────────────────────────
+document.getElementById('start-btn').addEventListener('click', () => {
+  document.getElementById('start-screen').style.display = 'none';
+  initGame();
+  phase = 'playing';
+  lastTS = performance.now();
+  requestAnimationFrame(loop);
+});
+
+document.getElementById('retry-btn').addEventListener('click', () => {
+  document.getElementById('gameover-screen').style.display = 'none';
+  initGame();
+  phase = 'playing';
+  lastTS = performance.now();
+  requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
